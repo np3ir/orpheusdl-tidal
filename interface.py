@@ -1,3 +1,4 @@
+from utils.audio_policy import flac_only
 import base64
 import json
 import logging
@@ -573,7 +574,7 @@ class ModuleInterface:
                     image_url = self._generate_artwork_url(album_data.get('cover'), size=56)
                 # Preview URL - use previewUrl from search results if available
                 # The GUI handles lazy-loading via get_preview_stream_url for tracks without it
-                preview_url = i.get('previewUrl')
+                preview_url = None if flac_only() else i.get('previewUrl')
             elif query_type is DownloadTypeEnum.album:
                 artists = [j.get('name') for j in i.get('artists')]
                 duration = i.get('duration')
@@ -1364,6 +1365,9 @@ class ModuleInterface:
 
     def get_track_info(self, track_id: str, quality_tier: QualityEnum, codec_options: CodecOptions,
                        data=None, **kwargs) -> TrackInfo:
+        if flac_only():
+            quality_tier = QualityEnum.HIFI
+            codec_options = CodecOptions(proprietary_codecs=False, spatial_codecs=False)
         if data is None:
             data = {}
 
@@ -1476,19 +1480,35 @@ class ModuleInterface:
                 manifest = json.loads(base64.b64decode(stream_data['manifest']))
                 track_codec = CodecEnum['AAC' if 'mp4a' in manifest['codecs'] else manifest['codecs'].upper()]
 
-            if not codec_data[track_codec].spatial:
-                if not codec_options.proprietary_codecs and codec_data[track_codec].proprietary:
-                    self.print(f'Proprietary codecs are disabled, if you want to download {track_codec.name}, '
-                               f'set "proprietary_codecs": true', drop_level=1)
+            if flac_only():
+                # A quality request is not a codec guarantee. Retry CD FLAC only.
+                if track_codec is not CodecEnum.FLAC:
                     stream_data = self.session.get_stream_url(track_id, 'LOSSLESS')
-
+                    audio_track = None
                     if stream_data['manifestMimeType'] == 'application/dash+xml':
                         manifest = base64.b64decode(stream_data['manifest'])
-                        audio_track = self.parse_mpd(manifest)[0]  # Only one AudioTrack?
+                        audio_track = self.parse_mpd(manifest)[0]
                         track_codec = audio_track.codec
                     else:
                         manifest = json.loads(base64.b64decode(stream_data['manifest']))
                         track_codec = CodecEnum['AAC' if 'mp4a' in manifest['codecs'] else manifest['codecs'].upper()]
+                if track_codec is not CodecEnum.FLAC:
+                    raise ValueError('FLAC only: track omitted; native FLAC unavailable')
+
+            else:
+                if not codec_data[track_codec].spatial:
+                    if not codec_options.proprietary_codecs and codec_data[track_codec].proprietary:
+                        self.print(f'Proprietary codecs are disabled, if you want to download {track_codec.name}, '
+                                   f'set "proprietary_codecs": true', drop_level=1)
+                        stream_data = self.session.get_stream_url(track_id, 'LOSSLESS')
+
+                        if stream_data['manifestMimeType'] == 'application/dash+xml':
+                            manifest = base64.b64decode(stream_data['manifest'])
+                            audio_track = self.parse_mpd(manifest)[0]  # Only one AudioTrack?
+                            track_codec = audio_track.codec
+                        else:
+                            manifest = json.loads(base64.b64decode(stream_data['manifest']))
+                            track_codec = CodecEnum['AAC' if 'mp4a' in manifest['codecs'] else manifest['codecs'].upper()]
 
             if audio_track:
                 download_args = {'audio_track': audio_track}
@@ -1663,6 +1683,9 @@ class ModuleInterface:
 
     def get_track_download(self, file_url: str = None, audio_track: AudioTrack = None, codec: CodecEnum = None, **kwargs) \
             -> TrackDownloadInfo:
+        resolved_codec = audio_track.codec if audio_track is not None else codec
+        if flac_only() and resolved_codec is not CodecEnum.FLAC:
+            raise ValueError('FLAC only: refused audio transfer for non-FLAC or unknown codec')
         # only file_url or audio_track at a time
 
         # Single URL (non-DASH): return URL as-is (no transcode)
@@ -1711,11 +1734,16 @@ class ModuleInterface:
             for temp_location in temp_locations:
                 silentremove(temp_location)
         except Exception:
-            self.print('FFmpeg is not installed or working! Using fallback, may have errors')
-            return TrackDownloadInfo(
-                download_type=DownloadEnum.TEMP_FILE_PATH,
-                temp_file_path=merged_temp_location,
-            )
+            if flac_only():
+                for path in temp_locations + [merged_temp_location, output_location]:
+                    silentremove(path)
+                raise RuntimeError('FLAC only: FLAC extraction failed; temporary audio removed')
+            else:
+                self.print('FFmpeg is not installed or working! Using fallback, may have errors')
+                return TrackDownloadInfo(
+                    download_type=DownloadEnum.TEMP_FILE_PATH,
+                    temp_file_path=merged_temp_location,
+                )
 
         return TrackDownloadInfo(
             download_type=DownloadEnum.TEMP_FILE_PATH,
@@ -1939,6 +1967,8 @@ class ModuleInterface:
             return None
 
     def get_preview_stream_url(self, track_id: str):
+        if flac_only():
+            return None  # Lossy previews are disabled in strict mode.
         """Fetch a 30-second preview stream URL for a track.
         Works without user login by using a guest (client_credentials) session.
         Tries v1 PREVIEW API first, then falls back to v2 OpenAPI (web player API).
