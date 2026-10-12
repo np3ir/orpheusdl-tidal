@@ -1,3 +1,4 @@
+import time
 from utils.audio_policy import flac_only
 import base64
 import json
@@ -225,12 +226,17 @@ class ModuleInterface:
                     module_controller.temporary_settings_controller.set('sessions', saved_sessions)
 
                 # check for a valid subscription
-                try:
-                    subscription_info = sessions[session_type].get_subscription()
-                    subscription = self.check_subscription(subscription_info)
-                except Exception as e:
-                    logging.debug(f"{module_information.service_name}: Failed to check subscription: {e}")
-                    subscription = False
+                # retry: a transient network/token hiccup must not look like "no subscription"
+                subscription = False
+                for _attempt in range(3):
+                    try:
+                        subscription_info = sessions[session_type].get_subscription()
+                        subscription = self.check_subscription(subscription_info)
+                        break
+                    except Exception as e:
+                        logging.debug(f"{module_information.service_name}: Failed to check subscription "
+                                      f"(attempt {_attempt + 1}/3): {e}")
+                        time.sleep(2)
 
                 if not subscription:
                     if is_gui_mode:
@@ -239,7 +245,15 @@ class ModuleInterface:
                         saved_sessions = {} # Clear so we go to guest mode
                         break
 
-                    confirm = input(' Do you want to relogin? [Y/n]: ')
+                    try:
+                        confirm = input(' Do you want to relogin? [Y/n]: ')
+                    except EOFError:
+                        # non-interactive run (no stdin): can't relogin, keep the saved
+                        # sessions untouched and continue with a guest session instead of crashing
+                        self.print(f'{module_information.service_name}: subscription check failed and '
+                                   f'no terminal to relogin -> using guest session (saved sessions kept)')
+                        use_guest = True
+                        break
 
                     if confirm.upper() == 'N':
                         self.print('Exiting...')
