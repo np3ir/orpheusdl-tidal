@@ -1,3 +1,4 @@
+from utils.audio_policy import flac_only
 import base64
 import hashlib
 import json
@@ -18,6 +19,66 @@ from urllib.parse import parse_qs, quote
 from datetime import datetime, timedelta
 
 from utils.utils import create_requests_session
+
+import os
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- Tidal rate-limit protection (mirrors tiddl-elvigilante) -------------------
+# OrpheusDL used to burst Tidal API calls and retry 429s aggressively (urllib3
+# total=10), which escalates 429 -> account block. Here we (a) space every API
+# request proactively so we rarely hit 429, (b) honour Retry-After on a 429, and
+# (c) abort the run after too many 429s so the account is never hammered.
+try:
+    from utils.rate_limit import rpm_for as _rpm_for
+    _TIDAL_RPM = _rpm_for('tidal', 'ORPHEUS_TIDAL_RPM', 45)  # 0 = disabled
+except Exception:
+    _TIDAL_RPM = int(os.environ.get('ORPHEUS_TIDAL_RPM', '45') or 45)
+_TIDAL_429_ABORT = max(1, int(os.environ.get('ORPHEUS_TIDAL_429_ABORT', '10')))
+
+class _TidalRateGate:
+    """Proactive fixed-interval spacing shared across all Tidal API calls."""
+    def __init__(self, rpm):
+        self._interval = (60.0 / rpm) if rpm and rpm > 0 else 0.0
+        self._lock = threading.Lock()
+        self._last = 0.0
+    def wait(self):
+        if self._interval <= 0:
+            return  # pacing disabled for this service (rate_limit_rpm = 0)
+        with self._lock:
+            delay = self._interval - (time.monotonic() - self._last)
+            if delay > 0:
+                time.sleep(delay)
+            self._last = time.monotonic()
+
+class _Tidal429Guard:
+    """Run-wide 429 circuit breaker (per process = per orpheus invocation)."""
+    def __init__(self, limit):
+        self._limit = limit
+        self._count = 0
+        self._lock = threading.Lock()
+    def note(self):
+        with self._lock:
+            self._count += 1
+            return self._count
+    def tripped(self):
+        with self._lock:
+            return self._count >= self._limit
+
+_tidal_gate = _TidalRateGate(_TIDAL_RPM)
+_tidal_429_guard = _Tidal429Guard(_TIDAL_429_ABORT)
+
+def _make_tidal_session():
+    """Session that retries only transient 5xx, NOT 429 (429 is handled in _get
+    with Retry-After + the circuit breaker, so it never hammers Tidal)."""
+    s = requests.Session()
+    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[500, 502, 503, 504],
+                    respect_retry_after_header=True)
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+    s.mount('https://', HTTPAdapter(max_retries=retries))
+    return s
+# ------------------------------------------------------------------------------
 
 technical_names = {
     'eac3': 'E-AC-3 JOC (Dolby Digital Plus with Dolby Atmos, with 5.1 bed)',
@@ -65,9 +126,9 @@ class TidalApi(object):
         self.sessions = sessions
         self.default: SessionType = SessionType.TV  # Change to TV or MOBILE depending on AC-4/360RA
 
-        self.s = create_requests_session()
+        self.s = _make_tidal_session()
 
-    def _get(self, url, params=None, refresh=False, session_override=None):
+    def _get(self, url, params=None, refresh=False, session_override=None, _attempt=0):
         if params is None:
             params = {}
         # Try to get the requested session, fallback to GUEST if missing, or use the first available session
@@ -88,16 +149,36 @@ class TidalApi(object):
         # if 'limit' not in params:
         #     params['limit'] = '9999'
 
+        _tidal_gate.wait()  # proactive spacing so we rarely trigger a 429
         resp = self.s.get(
             self.TIDAL_API_BASE + url,
             headers=session.auth_headers(),
             params=params,
             timeout=60)
 
+        # 429: honour Retry-After and back off; abort the run after too many so we
+        # never hammer Tidal into blocking the account (mirrors tiddl-elvigilante).
+        if resp.status_code == 429:
+            n = _tidal_429_guard.note()
+            if _tidal_429_guard.tripped():
+                raise TidalError(
+                    'Tidal rate-limit (429) hit %d times this run - aborting to protect the '
+                    'account. Wait a while, lower ORPHEUS_TIDAL_RPM, then retry.' % n)
+            try:
+                wait_s = int(resp.headers.get('Retry-After', '30'))
+            except (TypeError, ValueError):
+                wait_s = 30
+            wait_s = min(max(wait_s, 5), 120)
+            if _attempt < 5:
+                print('  [Tidal] 429 rate-limited; waiting %ds (Retry-After) then retrying...' % wait_s, flush=True)
+                time.sleep(wait_s)
+                return self._get(url, params, refresh, session_override, _attempt + 1)
+            raise TidalError('Tidal 429 rate-limit persisted after retries.')
+
         # if the request 401s or 403s, try refreshing the session in case that helps
         if not refresh and (resp.status_code == 401 or resp.status_code == 403):
             session.refresh()
-            return self._get(url, params, True, session_override)
+            return self._get(url, params, True, session_override, _attempt)
 
         resp_json = None
         try:
@@ -126,12 +207,25 @@ class TidalApi(object):
         return resp_json
 
     def get_stream_url(self, track_id, quality):
-        return self._get('tracks/' + str(track_id) + '/playbackinfopostpaywall/v4', {
-            'playbackmode': 'STREAM',
-            'assetpresentation': 'FULL',
-            'audioquality': quality,
-            'prefetch': 'false'
-        })
+        if not flac_only():
+            return self._get('tracks/' + str(track_id) + '/playbackinfopostpaywall/v4', {
+                'playbackmode': 'STREAM',
+                'assetpresentation': 'FULL',
+                'audioquality': quality,
+                'prefetch': 'false'
+            })
+        if quality not in {'LOSSLESS', 'HI_RES_LOSSLESS'}:
+            raise ValueError('FLAC only: lossy quality requests are disabled')
+        params = {'playbackmode': 'STREAM', 'assetpresentation': 'FULL',
+                  'audioquality': quality, 'prefetch': 'false'}
+        endpoint = 'tracks/' + str(track_id) + '/playbackinfopostpaywall/v4'
+        try:
+            return self._get(endpoint, params)
+        except (TidalRequestError, TidalError):
+            if quality != 'HI_RES_LOSSLESS':
+                raise
+            params['audioquality'] = 'LOSSLESS'
+            return self._get(endpoint, params)
 
     def get_track_preview_url(self, track_id, session_override=None):
         """Fetch a 30-second preview for a track. Uses PREVIEW assetpresentation.
